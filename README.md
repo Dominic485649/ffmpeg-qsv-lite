@@ -8,6 +8,8 @@
 
 目标不是做“全功能 FFmpeg”，而是构建一个体积更小、组件更少、路径更明确的 Intel GPU 硬件转码版 `ffmpeg.exe`。
 
+### 如果需要nvidia的nvenc硬编解码器和cuda相关滤镜支持，请看[ffmpeg-nvenc-lite](https://github.com/Dominic485649/ffmpeg-nvenc-lite)
+
 ---
 
 ## 设计目标
