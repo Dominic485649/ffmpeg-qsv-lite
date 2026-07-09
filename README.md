@@ -1,6 +1,6 @@
 # ffmpeg-qsv-lite
 
-基于 FFmpeg n8.1.2 的 Intel QSV / oneVPL 专用转码构建，面向 Windows 用户。
+基于 FFmpeg master 的 Intel QSV / oneVPL 专用转码构建，面向 Windows 用户。
 
 本项目专注于：
 
@@ -30,16 +30,16 @@
 
 ## 版本信息
 
-| 项目           | 版本 / 配置                  |
+| 项目          | 版本 / 配置                |
 | ------------ | ------------------------ |
-| FFmpeg       | n8.1.2                   |
+| FFmpeg       | master                   |
 | Compiler     | GCC 13-posix             |
 | Target       | Windows x86_64           |
 | Toolchain    | Linux / WSL2 → MinGW-w64 |
 | Acceleration | Intel QSV / oneVPL       |
 | CPU baseline | x86-64-v3                |
 | Link         | Static build             |
-| ffprobe      | 默认不构建                    |
+| ffprobe      | 默认不构建                |
 
 ---
 
@@ -49,13 +49,9 @@
 | ----------------- | ------- | ------------------------------------------ |
 | `hevc_qsv`        | 视频      | H.265 / HEVC QSV 硬件编码                      |
 | `av1_qsv`         | 视频      | AV1 QSV 硬件编码                               |
-| `libfdk_aac`      | 音频      | Fraunhofer FDK AAC 高质量编码                   |
-| `aac_at`          | 音频      | Apple AudioToolbox AAC 编码                  |
-| `wrapped_avframe` | 内部 / 测试 | 用于 `-f null -`、滤镜 smoke test、benchmark 等场景 |
+| `aac_nmr`      | 音频      | 新版本FFmpeg默认的aac编码器                   |
 
 > 所有通用软件视频编码器均已禁用，视频编码路径只保留 QSV。
-
-注意：`aac_at` 依赖 AudioToolboxWrapper。部分环境可能仍需要可加载的 Apple CoreAudioToolbox 运行时；如果只追求稳定 AAC 输出，推荐使用 `libfdk_aac`。
 
 ---
 
@@ -343,29 +339,6 @@ extract_extradata
 
 ---
 
-## 适用场景
-
-适合：
-
-* Intel 核显 / Arc 独显用户
-* HEVC / AV1 QSV 硬件编码
-* QSV 缩放、反交错、叠加、拼接
-* 精简单用途压制工具
-* 不需要完整 FFmpeg 生态的专用构建
-* 希望减少误调用软件编码器的硬件转码工作流
-
-不适合：
-
-* 字幕烧录
-* 质量评测
-* 全格式考古解码
-* 图片编码
-* 软件编码器压制
-* CUDA / NVENC / AMF / VAAPI 工作流
-* FFmpegFreeUI 全功能模式
-* BM3D / AI 降噪一体化处理
-
----
 
 ## 许可证说明
 
