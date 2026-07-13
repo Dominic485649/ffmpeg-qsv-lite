@@ -75,6 +75,8 @@ SKIPPED_ITEMS=()
 usage() {
   cat <<EOF
 Usage:
+  ./ffmpeg.sh                    update sources, then build
+  ./ffmpeg.sh all                update sources, then build
   ./ffmpeg.sh build              build $BACKEND lite ffmpeg.exe from local sources
   ./ffmpeg.sh build ffmpeg       rebuild from ffmpeg stage
   ./ffmpeg.sh update             update only the source repos used by this backend
@@ -101,6 +103,20 @@ trap on_error ERR
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "missing command: $1"; exit 1; }; }
 
+git_retry() {
+  local attempt
+  for attempt in 1 2 3 4; do
+    if (( attempt % 2 == 1 )); then
+      "$@" && return 0
+    else
+      env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy "$@" && return 0
+    fi
+    echo "git command failed ($attempt/4), retrying..." >&2
+    sleep "$((attempt * 5))"
+  done
+  return 1
+}
+
 canonical_tool() {
   local v="$1"
   if [[ "$v" == */* ]]; then
@@ -119,6 +135,36 @@ first_tool() {
   done
   echo "tool not found: $*" >&2
   exit 1
+}
+
+verify_managed_toolchain() {
+  local marker="$LLVM_MINGW_ROOT/.asset_url" expected
+  [[ -f "$marker" ]] || { echo "managed llvm-mingw missing; run ../full/ffmpeg.sh tool"; exit 1; }
+  expected="$(python3 - <<'PY'
+import json, re, time, urllib.request
+for attempt in range(4):
+    try:
+        with urllib.request.urlopen('https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest', timeout=60) as r:
+            data = json.load(r)
+        break
+    except Exception:
+        if attempt == 3:
+            raise
+        time.sleep(5 * (attempt + 1))
+rx = re.compile(r'^llvm-mingw-.*-ucrt-ubuntu-22\.04-x86_64\.tar\.xz$')
+for asset in data.get('assets', []):
+    if rx.match(asset['name']):
+        print(asset['browser_download_url'])
+        break
+else:
+    raise SystemExit('latest llvm-mingw Linux asset not found')
+PY
+)"
+  [[ "$(cat "$marker")" == "$expected" ]] || { echo "llvm-mingw is stale; run ../full/ffmpeg.sh tool"; exit 1; }
+  [[ -f /usr/local/cmake/.asset_url && -f /usr/local/ninja/.asset_url && -f /usr/local/nasm/.tag ]] || {
+    echo "managed CMake/Ninja/NASM markers are missing; run ../full/ffmpeg.sh tool"
+    exit 1
+  }
 }
 
 source_dir() {
@@ -163,7 +209,7 @@ clone_if_missing() {
   local name="$1" dir="$ROOT/$name"
   if ! source_dir "$name" >/dev/null; then
     echo "===> clone $name"
-    git clone --filter=blob:none "${URLS[$name]}" "$dir"
+    git_retry git clone --filter=blob:none "${URLS[$name]}" "$dir"
   fi
 }
 
@@ -174,11 +220,11 @@ update_one() {
   git -C "$dir" reset --hard
   git -C "$dir" clean -fdx
   git -C "$dir" remote set-url origin "${URLS[$name]}" 2>/dev/null || true
-  git -C "$dir" fetch --tags --prune --force origin
+  git_retry git -C "$dir" fetch --tags --prune --force origin
   if [[ "$name" == "ffmpeg-source" ]]; then
     ref="$FFMPEG_REF"
     git -C "$dir" checkout "$ref" 2>/dev/null || git -C "$dir" switch "$ref"
-    git -C "$dir" pull --ff-only origin "$ref" || true
+    git_retry git -C "$dir" pull --ff-only origin "$ref"
   else
     ref="$(latest_stable_tag "$name")"
     [[ -n "$ref" ]] || ref="master"
@@ -193,6 +239,15 @@ run_update() {
   for r in "${repos[@]}"; do
     [[ "$r" == "ffmpeg" ]] && continue
     update_one "$r"
+  done
+  echo "== Source version manifest =="
+  for r in "${repos[@]}"; do
+    [[ "$r" == "ffmpeg" ]] && continue
+    local dir
+    dir="$(source_dir "$r")"
+    printf '%-24s ref=%-20s commit=%s\n' "$r" \
+      "$(git -C "$dir" describe --tags --always)" \
+      "$(git -C "$dir" rev-parse --short=12 HEAD)"
   done
 }
 
@@ -241,6 +296,7 @@ EOF
 setup_build_env() {
   export PATH="$LLVM_MINGW_ROOT/bin:/usr/local/bin:$HOME/.local/bin:$PREFIX/bin:$PATH"
   need_cmd git; need_cmd cmake; need_cmd meson; need_cmd ninja; need_cmd make; need_cmd pkg-config; need_cmd python3
+  verify_managed_toolchain
   CC="$(canonical_tool "${CC:-$TARGET-clang}")"
   CXX="$(canonical_tool "${CXX:-$TARGET-clang++}")"
   AR="$(canonical_tool "${AR:-llvm-ar}")"
@@ -383,11 +439,14 @@ EOF
 }
 
 seed_shaderc_from_common() {
-  [[ -f "$COMMON_PREFIX/lib/libshaderc_combined.a" && -d "$COMMON_PREFIX/include/shaderc" ]] || return 1
+  local spirv_include="$COMMON_PREFIX/include/spirv"
+  [[ -d "$spirv_include" ]] || spirv_include="$ROOT/build/_src/libshaderc/third_party/spirv-headers/include/spirv"
+  [[ -f "$COMMON_PREFIX/lib/libshaderc_combined.a" && -d "$COMMON_PREFIX/include/shaderc" && -d "$spirv_include" ]] || return 1
   echo "Using existing static shaderc from $COMMON_PREFIX"
   mkdir -p "$PREFIX/lib" "$PREFIX/include"
   cp -f "$COMMON_PREFIX/lib/libshaderc_combined.a" "$PREFIX/lib/"
   cp -a "$COMMON_PREFIX/include/shaderc" "$PREFIX/include/"
+  cp -a "$spirv_include" "$PREFIX/include/"
   write_shaderc_pc
 }
 
@@ -423,11 +482,14 @@ build_shaderc_from_source() {
   cmake --build "$bld" --parallel "$JOBS"
   cmake --install "$bld"
   [[ -f "$PREFIX/lib/libshaderc_combined.a" ]] || cp -f "$bld/libshaderc/libshaderc_combined.a" "$PREFIX/lib/"
+  [[ -d "$stage/third_party/spirv-headers/include/spirv" ]] || { echo "shaderc SPIR-V headers missing"; exit 1; }
+  cp -a "$stage/third_party/spirv-headers/include/spirv" "$PREFIX/include/"
   write_shaderc_pc
 }
 
 patch_ffmpeg_libplacebo_vulkan_import() {
   local ff_stage="$1" cfg="$PREFIX/include/libplacebo/config.h" api
+  sed -i 's/-lstdc++/-lc++/g' "$ff_stage/configure"
   [[ -f "$cfg" ]] || return 0
   api="$(sed -n 's/^#define PL_API_VER[[:space:]]\+\([0-9]\+\).*/\1/p' "$cfg" | head -n1)"
   [[ -n "$api" ]] || return 0
@@ -440,6 +502,12 @@ patch_ffmpeg_libplacebo_vulkan_import() {
 
 validate_config() {
   local config_mak="$1" config_h="$2" unexpected allowed filter_line filter_name filter_lower f found
+  local allowed_filters=("${COMMON_FILTERS[@]}")
+  if [[ "$BACKEND" == "nvenc" ]]; then
+    allowed_filters+=("${NVENC_FILTERS[@]}")
+  else
+    allowed_filters+=("${QSV_FILTERS[@]}")
+  fi
   [[ "$LTO_ENABLE" != "1" ]] || grep -Eq -- '-flto(=thin|=auto)?' "$config_mak" || { echo "LTO not found in config.mak"; exit 1; }
   grep -q '^CONFIG_AAC_ENCODER=yes$' "$config_mak" || { echo "native AAC encoder disabled"; exit 1; }
   grep -q '^CONFIG_LIBSOXR=yes$' "$config_mak" || { echo "libsoxr disabled"; exit 1; }
@@ -452,13 +520,13 @@ validate_config() {
     grep -q '^CONFIG_AV1_NVENC_ENCODER=yes$' "$config_mak" || { echo "av1_nvenc disabled"; exit 1; }
     grep -q '^CONFIG_HEVC_NVENC_ENCODER=yes$' "$config_mak" || { echo "hevc_nvenc disabled"; exit 1; }
     grep -q '^CONFIG_CUDA_NVCC=yes$' "$config_mak" || { echo "cuda-nvcc disabled"; exit 1; }
-    allowed='CONFIG_(H264_NVENC|HEVC_NVENC|AV1_NVENC|AAC)_ENCODER=yes|CONFIG_FRAME_THREAD_ENCODER=yes'
+    allowed='CONFIG_(HEVC_NVENC|AV1_NVENC|AAC)_ENCODER=yes|CONFIG_FRAME_THREAD_ENCODER=yes'
     grep -q 'nonfree' "$config_h" || { echo "NVENC build is expected to be nonfree"; exit 1; }
   else
     grep -q '^CONFIG_AV1_QSV_ENCODER=yes$' "$config_mak" || { echo "av1_qsv disabled"; exit 1; }
     grep -q '^CONFIG_HEVC_QSV_ENCODER=yes$' "$config_mak" || { echo "hevc_qsv disabled"; exit 1; }
     grep -q '^CONFIG_LIBVPL=yes$' "$config_mak" || { echo "libvpl disabled"; exit 1; }
-    allowed='CONFIG_(H264_QSV|HEVC_QSV|AV1_QSV|AAC)_ENCODER=yes|CONFIG_FRAME_THREAD_ENCODER=yes'
+    allowed='CONFIG_(HEVC_QSV|AV1_QSV|AAC)_ENCODER=yes|CONFIG_FRAME_THREAD_ENCODER=yes'
   fi
   unexpected="$(grep -E '^CONFIG_.*_ENCODER=yes$' "$config_mak" | grep -Ev "$allowed" || true)"
   [[ -z "$unexpected" ]] || { echo "unexpected encoders:"; printf '%s\n' "$unexpected"; exit 1; }
@@ -472,7 +540,7 @@ validate_config() {
     filter_name="${BASH_REMATCH[1]}"
     filter_lower="$(printf '%s' "$filter_name" | tr '[:upper:]' '[:lower:]')"
     found=0
-    for f in "${COMMON_FILTERS[@]}" "${NVENC_FILTERS[@]}" "${QSV_FILTERS[@]}"; do
+    for f in "${allowed_filters[@]}"; do
       [[ "$f" == "$filter_lower" ]] && { found=1; break; }
     done
     [[ "$found" -eq 1 ]] || { echo "unexpected filter: $filter_lower"; exit 1; }
@@ -506,6 +574,32 @@ check_single_file_imports() {
     exit 1
   fi
   echo "DLL imports are system-only."
+}
+
+verify_lite_binary() {
+  local exe="$1" output filters hwaccels name
+  local names=()
+  output="$("$exe" -hide_banner -encoders 2>/dev/null | tr -d '\r')"
+  mapfile -t names < <(awk '$1 ~ /^[VAS][A-Z.]{5}$/ && $2 != "=" { print $2 }' <<< "$output")
+  for name in "${names[@]}"; do
+    case "$BACKEND:$name" in
+      nvenc:aac|nvenc:hevc_nvenc|nvenc:av1_nvenc|qsv:aac|qsv:hevc_qsv|qsv:av1_qsv) ;;
+      *) echo "unexpected runtime encoder: $name"; exit 1 ;;
+    esac
+  done
+  grep -q 'nmr' <<< "$("$exe" -hide_banner -h encoder=aac 2>&1)" || { echo "NMR AAC coder missing"; exit 1; }
+  grep -q 'libplacebo' <<< "$("$exe" -hide_banner -h filter=libplacebo 2>&1)" || { echo "libplacebo filter help failed"; exit 1; }
+  filters="$("$exe" -hide_banner -filters 2>/dev/null | tr -d '\r')"
+  hwaccels="$("$exe" -hide_banner -hwaccels 2>/dev/null | tr -d '\r')"
+  if [[ "$BACKEND" == "nvenc" ]]; then
+    grep -q '[[:space:]]av1_nvenc[[:space:]]' <<< "$output" || { echo "av1_nvenc missing"; exit 1; }
+    grep -q '[[:space:]]scale_cuda[[:space:]]' <<< "$filters" || { echo "scale_cuda missing"; exit 1; }
+    grep -qx 'cuda' <<< "$hwaccels" || { echo "CUDA hwaccel missing"; exit 1; }
+  else
+    grep -q '[[:space:]]av1_qsv[[:space:]]' <<< "$output" || { echo "av1_qsv missing"; exit 1; }
+    grep -q '[[:space:]]scale_qsv[[:space:]]' <<< "$filters" || { echo "scale_qsv missing"; exit 1; }
+    grep -Eq '^(d3d11va|dxva2)$' <<< "$hwaccels" || { echo "QSV Windows hwaccel missing"; exit 1; }
+  fi
 }
 
 run_stage() {
@@ -557,6 +651,8 @@ EOF
     vulkan-headers)
       local s
       s="$(stage_src vulkan-headers)"
+      local vk_version
+      vk_version="$(git -C "$s" describe --tags --always 2>/dev/null | sed 's/^v//' | sed 's/-.*//')"
       mkdir -p "$PREFIX/include" "$PREFIX/lib" "$PREFIX/lib/pkgconfig"
       cp -rf "$s/include/"* "$PREFIX/include/"
       cat > "$PREFIX/lib/vulkan-1.def" <<EOF
@@ -576,7 +672,7 @@ includedir=\${prefix}/include
 
 Name: Vulkan-Loader
 Description: Windows Vulkan loader import library
-Version: 1.4.356
+Version: $vk_version
 Libs: -L\${libdir} -lvulkan-1
 Cflags: -I\${includedir}
 EOF
@@ -608,7 +704,7 @@ EOF
       ;;
 
     ffmpeg)
-      setup_cuda
+      [[ "$BACKEND" == "nvenc" ]] && setup_cuda
       PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists soxr libplacebo shaderc vulkan || { echo "required pkg-config files missing"; exit 1; }
       [[ "$BACKEND" == "qsv" ]] && PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists vpl || { [[ "$BACKEND" == "nvenc" ]] || exit 1; }
       [[ "$BACKEND" == "nvenc" ]] && PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists ffnvcodec || { [[ "$BACKEND" == "qsv" ]] || exit 1; }
@@ -688,13 +784,13 @@ EOF
 
       configure_cmd+=(--disable-encoders)
       if [[ "$BACKEND" == "nvenc" ]]; then
-        for e in h264_nvenc hevc_nvenc av1_nvenc aac; do add_if_exists "$ff_stage" --list-encoders "$e" --enable-encoder; done
+        for e in hevc_nvenc av1_nvenc aac; do add_if_exists "$ff_stage" --list-encoders "$e" --enable-encoder; done
       else
-        for e in h264_qsv hevc_qsv av1_qsv aac; do add_if_exists "$ff_stage" --list-encoders "$e" --enable-encoder; done
+        for e in hevc_qsv av1_qsv aac; do add_if_exists "$ff_stage" --list-encoders "$e" --enable-encoder; done
       fi
 
       configure_cmd+=(--disable-decoders)
-      for d in h264 hevc av1 vp9 vp8 mpeg2video mpeg4 msmpeg4v3 vc1 wmv3 mjpeg prores rawvideo png aac aac_latm mp3 ac3 eac3 truehd dca flac opus vorbis wavpack alac pcm_s16le pcm_s24le pcm_s32le pcm_f32le pcm_f64le; do
+      for d in h264 hevc av1 vp9 vp8 mpeg2video mpeg4 msmpeg4v3 vc1 wmv3 mjpeg prores rawvideo aac aac_latm mp3 ac3 eac3 truehd dca flac opus vorbis wavpack alac pcm_s16le pcm_s24le pcm_s32le pcm_f32le pcm_f64le; do
         add_if_exists "$ff_stage" --list-decoders "$d" --enable-decoder
       done
 
@@ -710,7 +806,7 @@ EOF
       configure_cmd+=(--disable-muxers)
       for m in matroska mp4 mov ipod mpegts null rawvideo adts wav flac ogg; do add_if_exists "$ff_stage" --list-muxers "$m" --enable-muxer; done
       configure_cmd+=(--disable-parsers)
-      for p in h264 hevc av1 aac ac3 dca mlp opus vorbis mjpeg vp9 vp8 mpeg4video vc1 png; do add_if_exists "$ff_stage" --list-parsers "$p" --enable-parser; done
+      for p in h264 hevc av1 aac ac3 dca mlp opus vorbis mjpeg vp9 vp8 mpeg4video vc1; do add_if_exists "$ff_stage" --list-parsers "$p" --enable-parser; done
       configure_cmd+=(--disable-bsfs)
       for b in h264_mp4toannexb hevc_mp4toannexb av1_metadata h264_metadata hevc_metadata aac_adtstoasc extract_extradata; do add_if_exists "$ff_stage" --list-bsfs "$b" --enable-bsf; done
       configure_cmd+=(--disable-protocols)
@@ -729,6 +825,7 @@ EOF
       printf '%q ' "${configure_cmd[@]}"; echo
       "${configure_cmd[@]}"
       validate_config ffbuild/config.mak config.h
+      mkdir -p libswscale/x86
       make -f ./Makefile -j"$FFMPEG_JOBS"
       make -f ./Makefile install
       popd >/dev/null
@@ -736,6 +833,7 @@ EOF
       "$STRIP" "$PREFIX/bin/ffmpeg.exe" || true
       cp -f "$PREFIX/bin/ffmpeg.exe" "$SCRIPT_DIR/ffmpeg.exe"
       check_single_file_imports "$SCRIPT_DIR/ffmpeg.exe"
+      verify_lite_binary "$SCRIPT_DIR/ffmpeg.exe"
       ;;
 
     *) echo "unknown stage: $stage"; exit 1 ;;
@@ -769,13 +867,13 @@ run_build() {
   fi
 }
 
-cmd="${1:-build}"
+cmd="${1:-all}"
 shift || true
 case "$cmd" in
+  all) run_update; run_build ;;
   build) run_build "${1:-}" ;;
   update) run_update ;;
   clean) rm -rf "$PREFIX" "$BUILDROOT" "$SCRIPT_DIR/ffmpeg.exe" ;;
   help|-h|--help) usage ;;
   *) usage; exit 1 ;;
 esac
-
