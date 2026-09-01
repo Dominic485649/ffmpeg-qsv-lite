@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
+export PYTHONIOENCODING=UTF-8
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,6 +37,7 @@ NVCC_THREADS="${NVCC_THREADS:-0}"
 declare -A URLS=(
   [ffmpeg-source]="https://github.com/FFmpeg/FFmpeg.git"
   [nv-codec-headers]="https://github.com/FFmpeg/nv-codec-headers.git"
+  [opus]="https://github.com/xiph/opus.git"
   [libvpl]="https://github.com/intel/libvpl.git"
   [libsoxr]="https://github.com/chirlu/soxr.git"
   [vapoursynth]="https://github.com/vapoursynth/vapoursynth.git"
@@ -45,6 +49,7 @@ declare -A URLS=(
 declare -A TAG_REGEX=(
   [ffmpeg-source]='master'
   [nv-codec-headers]='^n[0-9]+(\.[0-9]+)*$'
+  [opus]='^v?[0-9]+(\.[0-9]+)*$'
   [libvpl]='^v2\.[0-9]+(\.[0-9]+)*$'
   [libsoxr]='^v?[0-9]+(\.[0-9]+)*$'
   [vapoursynth]='^R[0-9]+(\.[0-9]+)*$'
@@ -53,7 +58,7 @@ declare -A TAG_REGEX=(
   [libplacebo]='^v[0-9]+(\.[0-9]+)*$'
 )
 
-COMMON_STAGES=(libsoxr libshaderc vulkan-headers libplacebo)
+COMMON_STAGES=(opus libsoxr libshaderc vulkan-headers libplacebo)
 if [[ "$BACKEND" == "nvenc" ]]; then
   STAGES=(nv-codec-headers vapoursynth "${COMMON_STAGES[@]}" ffmpeg)
 else
@@ -71,6 +76,8 @@ QSV_FILTERS=(scale_qsv vpp_qsv deinterlace_qsv overlay_qsv hstack_qsv vstack_qsv
 
 CURRENT_STAGE=""
 SKIPPED_ITEMS=()
+BUILD_STARTED_AT=""
+HARDWARE_STATUS="not-run"
 
 usage() {
   cat <<EOF
@@ -87,6 +94,9 @@ Output:
 
 Native AAC NMR:
   -c:a aac -profile:a aac_low -aac_coder nmr -aac_nmr_speed 0
+
+External Opus:
+  -c:a libopus; native opus decoder remains enabled
 EOF
 }
 
@@ -199,7 +209,8 @@ latest_stable_tag() {
     | sed 's/\^{}$//' \
     | sort -u \
     | { grep -E "$regex" || true; } \
-    | while read -r tag; do printf "%s\t%s\n" "$(normalize_version "$name" "$tag")" "$tag"; done \
+    | while read -r tag; do printf "%s	%s
+" "$(normalize_version "$name" "$tag")" "$tag"; done \
     | sort -V \
     | tail -n 1 \
     | cut -f2
@@ -227,7 +238,7 @@ update_one() {
     git_retry git -C "$dir" pull --ff-only origin "$ref"
   else
     ref="$(latest_stable_tag "$name")"
-    [[ -n "$ref" ]] || ref="master"
+    [[ -n "$ref" ]] || { echo "No stable release tag matched for $name" >&2; exit 1; }
     git -C "$dir" switch --detach "$ref" 2>/dev/null || git -C "$dir" checkout --detach "$ref"
   fi
   git -C "$dir" submodule update --init --recursive || true
@@ -362,6 +373,44 @@ build_cmake() {
     "$@"
   cmake --build "$bld" --parallel "$JOBS"
   cmake --install "$bld"
+}
+
+build_opus() {
+  local stage
+  stage="$(stage_src opus)"
+  pushd "$stage" >/dev/null
+  if [[ ! -x ./configure ]]; then
+    if [[ -x ./autogen.sh ]]; then
+      sed -i '/dnn\/download_model\.sh/d' ./autogen.sh
+      ./autogen.sh
+    else
+      autoreconf -fiv
+    fi
+  fi
+  CPPFLAGS="-I$PREFIX/include" \
+  LDFLAGS="$LDFLAGS -L$PREFIX/lib" \
+  ./configure \
+    --host="$TARGET" \
+    --prefix="$PREFIX" \
+    --disable-shared \
+    --enable-static \
+    --disable-extra-programs \
+    --disable-deep-plc \
+    --disable-dred \
+    --disable-osce
+  make -j"$JOBS"
+  make install
+  popd >/dev/null
+  [[ -f "$PREFIX/lib/pkgconfig/opus.pc" && -f "$PREFIX/include/opus/opus.h" && -f "$PREFIX/lib/libopus.a" ]] || {
+    echo "libopus static install is incomplete"
+    exit 1
+  }
+  PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" \
+    "$PKG_CONFIG" --exists opus || { echo "pkg-config cannot find target libopus"; exit 1; }
+  [[ "$("$PKG_CONFIG" --variable=prefix opus)" == "$PREFIX" ]] || {
+    echo "pkg-config resolved libopus outside the Lite PREFIX"
+    exit 1
+  }
 }
 
 have_config_item() {
@@ -510,23 +559,27 @@ validate_config() {
   fi
   [[ "$LTO_ENABLE" != "1" ]] || grep -Eq -- '-flto(=thin|=auto)?' "$config_mak" || { echo "LTO not found in config.mak"; exit 1; }
   grep -q '^CONFIG_AAC_ENCODER=yes$' "$config_mak" || { echo "native AAC encoder disabled"; exit 1; }
+  grep -q '^CONFIG_LIBOPUS=yes$' "$config_mak" || { echo "libopus disabled"; exit 1; }
+  grep -q '^CONFIG_LIBOPUS_ENCODER=yes$' "$config_mak" || { echo "libopus encoder disabled"; exit 1; }
+  grep -q '^CONFIG_OPUS_DECODER=yes$' "$config_mak" || { echo "native Opus decoder disabled"; exit 1; }
   grep -q '^CONFIG_LIBSOXR=yes$' "$config_mak" || { echo "libsoxr disabled"; exit 1; }
   grep -q '^CONFIG_ARESAMPLE_FILTER=yes$' "$config_mak" || { echo "aresample filter disabled"; exit 1; }
   grep -q '^CONFIG_LIBPLACEBO_FILTER=yes$' "$config_mak" || { echo "libplacebo filter disabled"; exit 1; }
   grep -q '^CONFIG_VULKAN=yes$' "$config_mak" || { echo "Vulkan disabled"; exit 1; }
-  grep -q '^CONFIG_LIBSHADERC=yes$' "$config_mak" || { echo "libshaderc disabled"; exit 1; }
+  [[ -s "$PREFIX/lib/libshaderc_combined.a" && -d "$PREFIX/include/shaderc" ]] || { echo "libshaderc static library or headers missing"; exit 1; }
+  PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists shaderc || { echo "shaderc.pc is not usable"; exit 1; }
 
   if [[ "$BACKEND" == "nvenc" ]]; then
     grep -q '^CONFIG_AV1_NVENC_ENCODER=yes$' "$config_mak" || { echo "av1_nvenc disabled"; exit 1; }
     grep -q '^CONFIG_HEVC_NVENC_ENCODER=yes$' "$config_mak" || { echo "hevc_nvenc disabled"; exit 1; }
     grep -q '^CONFIG_CUDA_NVCC=yes$' "$config_mak" || { echo "cuda-nvcc disabled"; exit 1; }
-    allowed='CONFIG_(HEVC_NVENC|AV1_NVENC|AAC)_ENCODER=yes|CONFIG_FRAME_THREAD_ENCODER=yes'
+    allowed='CONFIG_(HEVC_NVENC|AV1_NVENC|AAC|LIBOPUS)_ENCODER=yes|CONFIG_FRAME_THREAD_ENCODER=yes'
     grep -q 'nonfree' "$config_h" || { echo "NVENC build is expected to be nonfree"; exit 1; }
   else
     grep -q '^CONFIG_AV1_QSV_ENCODER=yes$' "$config_mak" || { echo "av1_qsv disabled"; exit 1; }
     grep -q '^CONFIG_HEVC_QSV_ENCODER=yes$' "$config_mak" || { echo "hevc_qsv disabled"; exit 1; }
     grep -q '^CONFIG_LIBVPL=yes$' "$config_mak" || { echo "libvpl disabled"; exit 1; }
-    allowed='CONFIG_(HEVC_QSV|AV1_QSV|AAC)_ENCODER=yes|CONFIG_FRAME_THREAD_ENCODER=yes'
+    allowed='CONFIG_(HEVC_QSV|AV1_QSV|AAC|LIBOPUS)_ENCODER=yes|CONFIG_FRAME_THREAD_ENCODER=yes'
   fi
   unexpected="$(grep -E '^CONFIG_.*_ENCODER=yes$' "$config_mak" | grep -Ev "$allowed" || true)"
   [[ -z "$unexpected" ]] || { echo "unexpected encoders:"; printf '%s\n' "$unexpected"; exit 1; }
@@ -583,16 +636,22 @@ verify_lite_binary() {
   mapfile -t names < <(awk '$1 ~ /^[VAS][A-Z.]{5}$/ && $2 != "=" { print $2 }' <<< "$output")
   for name in "${names[@]}"; do
     case "$BACKEND:$name" in
-      nvenc:aac|nvenc:hevc_nvenc|nvenc:av1_nvenc|qsv:aac|qsv:hevc_qsv|qsv:av1_qsv) ;;
+      nvenc:aac|nvenc:hevc_nvenc|nvenc:av1_nvenc|nvenc:libopus|qsv:aac|qsv:hevc_qsv|qsv:av1_qsv|qsv:libopus) ;;
       *) echo "unexpected runtime encoder: $name"; exit 1 ;;
     esac
   done
+  grep -q '[[:space:]]libopus[[:space:]]' <<< "$output" || { echo "libopus missing"; exit 1; }
+  grep -q '[[:space:]]opus[[:space:]]' <<< "$("$exe" -hide_banner -decoders 2>/dev/null)" || { echo "native opus decoder missing"; exit 1; }
   grep -q 'nmr' <<< "$("$exe" -hide_banner -h encoder=aac 2>&1)" || { echo "NMR AAC coder missing"; exit 1; }
   grep -q 'libplacebo' <<< "$("$exe" -hide_banner -h filter=libplacebo 2>&1)" || { echo "libplacebo filter help failed"; exit 1; }
   filters="$("$exe" -hide_banner -filters 2>/dev/null | tr -d '\r')"
   hwaccels="$("$exe" -hide_banner -hwaccels 2>/dev/null | tr -d '\r')"
   if [[ "$BACKEND" == "nvenc" ]]; then
     grep -q '[[:space:]]av1_nvenc[[:space:]]' <<< "$output" || { echo "av1_nvenc missing"; exit 1; }
+    grep -Eq 'b_ref_mode|hierarchical.*[Bb]|[Bb].*hierarchical' <<< "$("$exe" -hide_banner -h encoder=av1_nvenc 2>&1)" || {
+      echo "av1_nvenc hierarchical B-reference option missing"
+      exit 1
+    }
     grep -q '[[:space:]]scale_cuda[[:space:]]' <<< "$filters" || { echo "scale_cuda missing"; exit 1; }
     grep -qx 'cuda' <<< "$hwaccels" || { echo "CUDA hwaccel missing"; exit 1; }
   else
@@ -600,6 +659,57 @@ verify_lite_binary() {
     grep -q '[[:space:]]scale_qsv[[:space:]]' <<< "$filters" || { echo "scale_qsv missing"; exit 1; }
     grep -Eq '^(d3d11va|dxva2)$' <<< "$hwaccels" || { echo "QSV Windows hwaccel missing"; exit 1; }
   fi
+}
+
+verify_opus_roundtrip() {
+  local exe="$1" test_dir="$BUILDROOT/opus-validation"
+  rm -rf "$test_dir"
+  mkdir -p "$test_dir"
+  dd if=/dev/zero of="$test_dir/input.s16" bs=192000 count=1 status=none
+  "$exe" -hide_banner -loglevel error \
+    -f s16le -ar 48000 -ac 2 -i "$test_dir/input.s16" \
+    -c:a libopus -b:a 96k -ar 48000 -ac 2 -f ogg "$test_dir/test.ogg"
+  "$exe" -hide_banner -loglevel error \
+    -i "$test_dir/test.ogg" -map 0:a:0 -c:a libopus -b:a 96k -ar 48000 -ac 2 -f ogg "$test_dir/decoded.ogg"
+  [[ -s "$test_dir/test.ogg" && -s "$test_dir/decoded.ogg" ]] || {
+    echo "libopus encode/decode output is empty"
+    exit 1
+  }
+  echo "Opus 48 kHz stereo encode/decode: OK"
+}
+
+write_build_manifest() {
+  local manifest_tool="$ROOT/build-manifests/write_manifest.py"
+  local args=(
+    python3 "$manifest_tool"
+    --root "$ROOT"
+    --build-name "qsv-lite"
+    --prefix "$PREFIX"
+    --artifact-dir "$SCRIPT_DIR"
+    --configure-file "$BUILDROOT/ffmpeg-configure.args"
+    --config-mak "$BUILDROOT/ffmpeg/ffbuild/config.mak"
+    --started "$BUILD_STARTED_AT"
+    --target-platform "Windows x86_64 via $TARGET"
+    --cpu-minimum "$CPU_FLAGS"
+    --source-repo "ffmpeg-source=$ROOT/ffmpeg-source"
+  )
+  local stage source
+  for stage in "${STAGES[@]}"; do
+    [[ "$stage" == "ffmpeg" ]] && continue
+    source="$(source_dir "$stage")"
+    args+=(--source-repo "$stage=$source")
+  done
+  args+=(
+    --validate "target-prefix opus.pc, opus headers, and static libopus checked"
+    --validate "FFmpeg configure enabled libopus, libopus encoder, and native opus decoder"
+    --validate "oneVPL was detected and linked"
+    --validate "final encoder whitelist contains AAC, libopus, and only expected video encoders"
+    --validate "48 kHz stereo Ogg Opus encode and final-ffmpeg decode/re-encode roundtrip succeeded"
+    --validate "native NMR AAC option remains present"
+    --skip "QSV hardware runtime encode not performed in this WSL build validation"
+  )
+  "${args[@]}" >/dev/null
+  echo "Build source manifest written for qsv-lite"
 }
 
 run_stage() {
@@ -633,6 +743,10 @@ Libs:
 Cflags: -I\${includedir}
 EOF
       cp -f "$PREFIX/lib/pkgconfig/vapoursynth.pc" "$PREFIX/lib/pkgconfig/VapourSynth.pc"
+      ;;
+
+    opus)
+      build_opus
       ;;
 
     libvpl)
@@ -753,11 +867,11 @@ EOF
         --disable-network
         --enable-w32threads
         --disable-pthreads
+        --enable-libopus
         --enable-libsoxr
         --enable-vulkan
         --enable-vulkan-static
         --enable-libplacebo
-        --enable-libshaderc
         --disable-opencl
         --enable-lto=thin
       )
@@ -784,9 +898,9 @@ EOF
 
       configure_cmd+=(--disable-encoders)
       if [[ "$BACKEND" == "nvenc" ]]; then
-        for e in hevc_nvenc av1_nvenc aac; do add_if_exists "$ff_stage" --list-encoders "$e" --enable-encoder; done
+        for e in hevc_nvenc av1_nvenc aac libopus; do add_if_exists "$ff_stage" --list-encoders "$e" --enable-encoder; done
       else
-        for e in hevc_qsv av1_qsv aac; do add_if_exists "$ff_stage" --list-encoders "$e" --enable-encoder; done
+        for e in hevc_qsv av1_qsv aac libopus; do add_if_exists "$ff_stage" --list-encoders "$e" --enable-encoder; done
       fi
 
       configure_cmd+=(--disable-decoders)
@@ -802,7 +916,7 @@ EOF
       fi
 
       configure_cmd+=(--disable-demuxers)
-      for d in matroska mov mpegts h264 hevc av1 rawvideo image2 concat aac mp3 flac ogg wav; do add_if_exists "$ff_stage" --list-demuxers "$d" --enable-demuxer; done
+      for d in matroska mov mpegts h264 hevc av1 rawvideo pcm_s16le image2 concat aac mp3 flac ogg wav; do add_if_exists "$ff_stage" --list-demuxers "$d" --enable-demuxer; done
       configure_cmd+=(--disable-muxers)
       for m in matroska mp4 mov ipod mpegts null rawvideo adts wav flac ogg; do add_if_exists "$ff_stage" --list-muxers "$m" --enable-muxer; done
       configure_cmd+=(--disable-parsers)
@@ -834,6 +948,7 @@ EOF
       cp -f "$PREFIX/bin/ffmpeg.exe" "$SCRIPT_DIR/ffmpeg.exe"
       check_single_file_imports "$SCRIPT_DIR/ffmpeg.exe"
       verify_lite_binary "$SCRIPT_DIR/ffmpeg.exe"
+      verify_opus_roundtrip "$SCRIPT_DIR/ffmpeg.exe"
       ;;
 
     *) echo "unknown stage: $stage"; exit 1 ;;
@@ -841,6 +956,7 @@ EOF
 }
 
 run_build() {
+  BUILD_STARTED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   setup_build_env
   need_repo ffmpeg-source
   local s start="${1:-}" start_seen=0
@@ -861,6 +977,7 @@ run_build() {
     run_stage "$s"
   done
   echo "Built: $SCRIPT_DIR/ffmpeg.exe"
+  write_build_manifest
   if [[ ${#SKIPPED_ITEMS[@]} -gt 0 ]]; then
     echo "Skipped unsupported items:"
     printf ' - %s\n' "${SKIPPED_ITEMS[@]}"
