@@ -9,6 +9,10 @@
 - 支持 libplacebo，适合 FFmpegFreeUI 的 Intel 硬件转码流程。
 - 不包含 `ffprobe`、`ffplay`、CUDA/NVENC 和大部分无关组件。
 
+- 编译 HDR10+ `hdr10plus` 逐帧画面分析滤镜、HEVC HDR Vivid T.35 元数据解码及原生 AVS1 `avs`/`cavs` 解码；不包含 AVS2/3 外部解码器、AVS 编码器或 Audio Vivid/AV3A。
+- QSV HEVC P8 Dolby Vision RPU 注入代码路径已编译；QSV AV1 P10 注入未实现，硬件往返未验收。
+- 音频解码保持现有白名单（不含 AVS/AV3A），音频编码仅保留 NMR AAC 和 `libopus`。
+
 ## 构建
 
 ```bash
