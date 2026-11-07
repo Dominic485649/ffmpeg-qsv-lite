@@ -14,7 +14,7 @@
 | 原始帧输出 | `rawvideo` |
 | 音频编码 | 原生 `aac`（含 NMR 参数）、`libopus` |
 | 视频解码 | H.264、HEVC、AV1、VP8/VP9、MPEG-2/4、VC-1、MJPEG、ProRes、原生 AVS1 等白名单 |
-| 音频解码 | AAC、MP3、AC-3/E-AC-3、TrueHD、DTS、FLAC、Opus、Vorbis、WavPack、ALAC、部分 PCM 等白名单 |
+| 音频解码 | AAC、MP3、AC-3/E-AC-3、TrueHD、DTS、FLAC、Opus、WavPack、ALAC、部分 PCM 等白名单 |
 | Windows 硬解 | H.264、HEVC、AV1、VP9、VC-1、MPEG-2 的 D3D11/D3D12 路径 |
 | QSV 滤镜 | `vpp_qsv`、`scale_qsv`、`deinterlace_qsv`、`overlay_qsv`、`hstack_qsv`、`vstack_qsv`、`xstack_qsv` |
 | 图像与色彩处理 | libplacebo、Vulkan、Shaderc、SPIR-V 与硬件上下文互操作 |
@@ -70,11 +70,13 @@ ffmpeg.exe -i input.mkv -map 0:v:0 -map "0:a:0?" -c:v av1_qsv -global_quality 28
 
 ### QSV VPP 缩放与 HEVC 编码
 
-此示例使用 D3D11 子设备，以及 QSV VPP 的软件帧输入路径；视频解码采用软件路径：
+此示例选择 Intel D3D11 设备并派生 QSV，视频解码使用软件路径。输入必须是**已知 25 fps 的恒定帧率素材**；输出在 VPP 后按该帧率显式重建时间戳：
 
 ```bash
-ffmpeg.exe -init_hw_device qsv=qs,child_device_type=d3d11va -filter_hw_device qs -i input.mkv -map 0:v:0 -map "0:a:0?" -vf "format=nv12,vpp_qsv=w=1920:h=1080" -c:v hevc_qsv -global_quality 24 -c:a aac -b:a 192k output-1080p.mkv
+ffmpeg.exe -init_hw_device d3d11va=dx:,vendor_id=0x8086 -init_hw_device qsv=qs@dx -filter_hw_device qs -i input-25fps.mkv -map 0:v:0 -map "0:a:0?" -vf "format=nv12,vpp_qsv=w=1920:h=1080,setpts=N/(25*TB)" -c:v hevc_qsv -low_power 1 -async_depth 1 -b:v 4M -c:a aac -b:a 192k output-1080p.mkv
 ```
+
+本机 FFmpeg/QSV/驱动组合的系统内存 VPP 路径存在时间戳丢失、零帧输出的情况。重建时间戳仅适用于帧率与起点明确的输入，不能直接套用于可变帧率素材；有音频时还需确认音画起点与同步。请核对实际输出帧数和时长，不要仅以进程退出成功判断处理完成。
 
 ### D3D11 / D3D12 硬解检查
 
@@ -123,10 +125,12 @@ CUDA_ENABLE=0 CUDA_TOOLKIT_ENABLE=0 ./ffmpeg.sh tool
 使用现有源码构建：
 
 ```bash
-./ffmpeg.sh build
+JOBS=2 FFMPEG_JOBS=2 ./ffmpeg.sh build
 ```
 
-不带参数或使用 `all` 会依次更新源码并构建。构建期间会核验受管理工具链，工具链版本查询与 Shaderc 固定依赖准备可能需要联网。
+目标 C/C++ 组件与 FFmpeg 使用 **ThinLTO**。可通过 `JOBS` 与 `FFMPEG_JOBS` 调整构建并发；上例使用两个编译作业。
+
+不带参数或使用 `all` 会依次更新源码并构建。默认会查询并核验受管理工具链版本；工具链已准备好时，`TOOLCHAIN_REFRESH=0` 可显式复用已安装且验证有效的版本。Shaderc 固定依赖准备可能需要联网。
 
 | 用途 | 默认路径 |
 |---|---|
@@ -143,8 +147,10 @@ CUDA_ENABLE=0 CUDA_TOOLKIT_ENABLE=0 ./ffmpeg.sh tool
 
 ## 实测与许可证
 
-2026-11-03 本地产物已通过隔离运行与导入依赖检查，并在 Intel Arc 上完成 QSV VPP、HEVC/AV1 编码和 libplacebo/Vulkan 处理。D3D11/D3D12 HEVC 硬解、硬件帧下载和实际输出帧数核验通过；SoXR、Opus 编码/原生解码与 AAC 编码通过。QSV 会话验收采用 D3D11 子设备。
+2026-11-07 本地产物已通过隔离单 EXE 运行、系统/驱动依赖、PE64/CFG、实际 ThinLTO 产物核验与完整离线回归。在 Intel Arc 上完成 HEVC/AV1 直接编码及 VPP 缩放，QSV 会话采用 Intel D3D11 派生设备；VPP 使用已知恒定帧率并显式重建时间戳，逐项核对实际输出帧数。
 
-相同输入的二次构建为 **8/8 唯一阶段内容缓存复用**。各版本的程序身份、文件体积与验证信息见对应 Release。
+D3D11/D3D12 HEVC 硬解、硬件帧下载、libplacebo/Vulkan 实际处理、SoXR、NMR AAC、Opus 编解码往返与原生 Ogg/Opus 解码通过。系统内存 VPP 的时间戳使用条件见上方示例；本机所测显式硬件上传的纹理创建路径未通过，不将其计为通过项。
+
+各版本的程序身份、文件体积与验证信息见对应 Release。
 
 自有脚本与文档采用 [MIT License](https://github.com/Dominic485649/ffmpeg-qsv-lite/blob/main/LICENSE)。当前 FFmpeg 许可证标识为 **`LGPL version 2.1 or later`**；FFmpeg、外部库、Intel 驱动与安装器组件适用各自许可证，使用与分发须满足相应许可要求。
